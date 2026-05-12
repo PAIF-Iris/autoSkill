@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skill-agent"
+version = "0.2.0"
+description = "Self-improving tool-learning AI agent with SDK and CLI"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=0.40.0",
+    "sentence-transformers>=3.0.0",
+    "faiss-cpu>=1.8.0",
+    "numpy>=1.26.0",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=1.0.0"]
+rich   = ["rich>=13.0.0"]
+http   = ["fastapi>=0.100.0", "uvicorn>=0.20.0"]
+all    = ["openai>=1.0.0", "rich>=13.0.0", "fastapi>=0.100.0", "uvicorn>=0.20.0"]
+
+[project.scripts]
+skill-agent = "skill_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["skill_agent*"]

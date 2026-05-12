@@ -1,0 +1,13 @@
+# ── Required ──────────────────────────────────────────────────────────────────
+anthropic>=0.40.0
+sentence-transformers>=3.0.0
+faiss-cpu>=1.8.0
+numpy>=1.26.0
+
+# ── Optional: OpenAI / ChatGPT support ───────────────────────────────────────
+# pip install openai
+# openai>=1.0.0
+
+# ── Optional: rich terminal output (tables, syntax highlighting) ──────────────
+# pip install rich
+# rich>=13.0.0
