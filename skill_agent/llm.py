@@ -34,7 +34,7 @@ from .providers.mock_provider    import MockProvider
 
 AnthropicClient = AnthropicProvider
 OpenAIClient    = OpenAIProvider
-MockClient      = MockProvider
+MockClient      = MockProvider   # backward-compatible alias
 
 # Re-export default model constants for any code that imported them from here
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514"

@@ -93,6 +93,10 @@ class MockProvider(BaseProvider):
                 "code": code,
             })
 
+        # ── Post-execution review ─────────────────────────────────────────────
+        if "verifying whether" in system:
+            return json.dumps({"appropriate": True, "reason": "Output matches query."})
+
         # ── Direct answer fallback ────────────────────────────────────────────
         return "I can help with that directly."
 

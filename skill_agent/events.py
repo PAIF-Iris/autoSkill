@@ -34,6 +34,7 @@ class EventType(str, Enum):
     TOOL_FOUND          {name, similarity, status}
     TOOL_EXECUTING      {name, kwargs}
     TOOL_EXECUTED       {name, success, latency_ms, output?, error?}
+    TOOL_REVIEWED       {name, appropriate, reason}
 
     TOOL_WRITING        {query}
     TOOL_WRITTEN        {name?, description?, success}
@@ -59,6 +60,7 @@ class EventType(str, Enum):
     TOOL_FOUND     = "tool_found"
     TOOL_EXECUTING = "tool_executing"
     TOOL_EXECUTED  = "tool_executed"
+    TOOL_REVIEWED  = "tool_reviewed"    # post-execution LLM review: {name, appropriate, reason}
 
     # ── Tool-create path ──────────────────────────────────────────────────────
     TOOL_WRITING   = "tool_writing"

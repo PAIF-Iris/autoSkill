@@ -88,11 +88,23 @@ def recognize(
     )
     best = candidates[0] if candidates else None
 
+    # ── DEBUG ─────────────────────────────────────────────────────────────────
+    print(f"\n[recognizer] query: {query!r}")
+    print(f"[recognizer] thresholds: HIGH={HIGH_SIMILARITY} MID={MID_SIMILARITY} MIN={MIN_SIMILARITY}")
+    if candidates:
+        for r in candidates:
+            tier = ("HIGH" if r.similarity >= HIGH_SIMILARITY
+                    else "MID" if r.similarity >= MID_SIMILARITY
+                    else "LOW")
+            print(f"[recognizer] candidate [{tier}] sim={r.similarity:.4f} "
+                  f"name={r.tool.name!r} status={r.tool.status}")
+    else:
+        print("[recognizer] no candidates above MIN_SIMILARITY")
+    # ── END DEBUG ─────────────────────────────────────────────────────────────
+
     # ── Step 2: high-confidence reuse — no LLM needed ────────────────────────
     if best and best.similarity >= HIGH_SIMILARITY:
-        logger.debug(
-            "High-confidence match (%.3f): '%s'", best.similarity, best.tool.name
-        )
+        print(f"[recognizer] → use_tool (HIGH confidence, no LLM call)")
         return RecognitionResult(
             action="use_tool",
             best_match=best,
@@ -103,15 +115,21 @@ def recognize(
         )
 
     # ── Step 3: build context for LLM classifier ──────────────────────────────
-    if best and best.similarity >= MID_SIMILARITY:
+    # Show the best candidate to the LLM at any similarity above MIN so it can
+    # decide whether to reuse it. Below MID we label it "low confidence" so the
+    # LLM knows to be more skeptical, but it still gets to see the candidate.
+    if best:
+        confidence = "high" if best.similarity >= MID_SIMILARITY else "low"
+        print(f"[recognizer] → asking LLM ({confidence} confidence, candidate presented)")
         candidate_block = (
-            f"Candidate tool in registry:\n"
+            f"Candidate tool in registry ({confidence} confidence match):\n"
             f"  name:        {best.tool.name}\n"
             f"  description: {best.tool.description}\n"
             f"  status:      {best.tool.status}\n"
             f"  similarity:  {best.similarity:.2f}"
         )
     else:
+        print(f"[recognizer] → asking LLM (no usable candidate)")
         candidate_block = "No sufficiently similar tool found in registry."
 
     user_prompt = (
@@ -131,6 +149,7 @@ def recognize(
         payload = json.loads(cleaned)
         action: Action = payload.get("action", "answer")
         reason: str = payload.get("reason", "")
+        print(f"[recognizer] LLM decided: {action!r} — {reason}")
 
         if action not in ("answer", "use_tool", "create_tool"):
             logger.warning("Unrecognised action '%s' from LLM — defaulting to 'answer'", action)

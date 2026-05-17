@@ -28,9 +28,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Optional, Tuple
 
+import numpy as np
+
 from .events import AgentEvent, EventType, EventHandler
 from .recognizer import recognize, RecognitionResult
-from .tool_registry import ToolRegistry, Tool
+from .tool_registry import ToolRegistry, Tool, RetrievalResult
 from .tool_writer import write_tool
 from .validator import validate_tool
 from .executor import execute_tool
@@ -50,6 +52,19 @@ KWARGS_EXTRACT_SYSTEM = (
     "Keys must exactly match the function's parameter names. "
     "Values must be the correct Python types (int, float, str, etc). "
     "Respond ONLY with a JSON object — no markdown, no commentary."
+)
+
+POST_EXEC_REVIEW_SYSTEM = (
+    "You are verifying whether a Python tool's output correctly answers a user's query.\n\n"
+    "You will receive:\n"
+    "  - The user's original query\n"
+    "  - The tool's name and description\n"
+    "  - The tool's raw output\n\n"
+    "Respond ONLY with valid JSON — no markdown, no commentary:\n"
+    '{"appropriate": true|false, "reason": "<one sentence>"}\n\n'
+    "Set appropriate=true if the output directly and correctly answers the query.\n"
+    "Set appropriate=false if the tool was misapplied, produced a wrong result, "
+    "or the output is irrelevant to what the user asked."
 )
 
 MAX_WRITE_ATTEMPTS = 3  # initial write + up to 2 revisions via tool_decision
@@ -270,14 +285,23 @@ class SkillAgent:
 
         if exec_result.success:
             logger.info("Tool '%s' succeeded in %.1f ms", tool.name, exec_result.latency_ms)
-            return AgentResult(
-                answer=exec_result.output,
-                action_taken=A_USED_TOOL,
-                tool_name=tool.name,
-                validation_passed=None,
-                latency_ms=exec_result.latency_ms,
-                notes=notes,
-            )
+            if self._post_execution_review(query, tool, exec_result.output):
+                return AgentResult(
+                    answer=exec_result.output,
+                    action_taken=A_USED_TOOL,
+                    tool_name=tool.name,
+                    validation_passed=None,
+                    latency_ms=exec_result.latency_ms,
+                    notes=notes,
+                )
+            # Tool ran but output doesn't answer the query — fall back
+            notes.append("Post-execution review: tool output was inappropriate; answering directly.")
+            logger.info("Tool '%s' output rejected by review — falling back.", tool.name)
+            result = self._answer_directly(query)
+            result.action_taken = A_USED_TOOL_FALLBACK
+            result.tool_name = tool.name
+            result.notes = notes + result.notes
+            return result
 
         logger.warning("Tool '%s' failed: %s — falling back.", tool.name, exec_result.error)
         notes.append(f"Tool failed ({exec_result.error}); answered directly.")
@@ -365,7 +389,15 @@ class SkillAgent:
             granted = self._handle_permissions(written.code)
 
             # ── 5. Save ───────────────────────────────────────────────────────
-            embedding = embed(f"{written.name}: {written.description}")
+            # Average the query embedding with the description embedding so the
+            # stored vector is biased toward user-question style. This ensures
+            # the same or similar queries score much higher in future searches
+            # than a pure name:description embedding would.
+            query_emb = embed(query)
+            desc_emb  = embed(f"{written.name}: {written.description}")
+            combined  = query_emb + desc_emb
+            norm      = np.linalg.norm(combined)
+            embedding = combined / norm if norm > 0 else desc_emb
             tool = Tool(name=written.name, description=written.description, code=written.code)
             try:
                 tool_id = self.registry.save_tool(tool, embedding)
@@ -373,6 +405,26 @@ class SkillAgent:
                 notes.append(f"Tool saved (id={tool_id}).")
                 logger.info("Tool '%s' saved as id=%d", written.name, tool_id)
             except Exception as exc:
+                # Name collision: a tool with this name already exists.
+                # Look it up and use it directly instead of the newly written code.
+                existing = self.registry.get_tool_by_name(written.name)
+                if existing is not None:
+                    notes.append(
+                        f"Tool '{written.name}' already exists (id={existing.tool_id})"
+                        f" — using existing version."
+                    )
+                    logger.info(
+                        "Name collision for '%s' — falling back to existing tool id=%d.",
+                        written.name, existing.tool_id,
+                    )
+                    return self._use_existing_tool(
+                        query,
+                        RecognitionResult(
+                            action="use_tool",
+                            best_match=RetrievalResult(tool=existing, similarity=1.0),
+                            reason="Name collision: redirected to existing tool.",
+                        ),
+                    )
                 notes.append(f"Could not save tool ({exc}).")
                 logger.warning("Tool save failed: %s", exc)
                 tool_id = None
@@ -400,14 +452,29 @@ class SkillAgent:
                     "Tool '%s' executed in %.1f ms → %r",
                     written.name, exec_result.latency_ms, exec_result.output,
                 )
-                return AgentResult(
-                    answer=exec_result.output,
-                    action_taken=A_CREATED_AND_USED,
-                    tool_name=written.name,
-                    validation_passed=True,
-                    latency_ms=exec_result.latency_ms,
-                    notes=notes,
+                tool_obj = Tool(
+                    name=written.name,
+                    description=written.description,
+                    code=written.code,
+                    tool_id=tool_id,
                 )
+                if self._post_execution_review(query, tool_obj, exec_result.output):
+                    return AgentResult(
+                        answer=exec_result.output,
+                        action_taken=A_CREATED_AND_USED,
+                        tool_name=written.name,
+                        validation_passed=True,
+                        latency_ms=exec_result.latency_ms,
+                        notes=notes,
+                    )
+                notes.append("Post-execution review: newly created tool output was inappropriate; answering directly.")
+                logger.info("Newly created tool '%s' output rejected by review — falling back.", written.name)
+                result = self._answer_directly(query)
+                result.action_taken = A_CREATED_FALLBACK
+                result.tool_name = written.name
+                result.validation_passed = True
+                result.notes = notes + result.notes
+                return result
 
             notes.append(
                 f"Execution failed on real query ({exec_result.error}); answering directly."
@@ -520,6 +587,53 @@ class SkillAgent:
                 return execute_in_docker(code, fn_name, kwargs, granted)
             logger.warning("Docker requested but not available; falling back to subprocess.")
         return execute_tool(code, fn_name, kwargs)
+
+    # ── Post-execution review ─────────────────────────────────────────────────
+
+    def _post_execution_review(
+        self, query: str, tool: "Tool", output: Any
+    ) -> bool:
+        """
+        Ask the LLM whether the tool's output actually answers the query.
+
+        Returns True if appropriate (use the tool output as the answer),
+        False if the tool was misapplied (caller should fall back to direct answer).
+        Defaults to True on any LLM failure so a bad review call never silently
+        drops a correct tool result.
+        """
+        user_prompt = (
+            f"User query: {query}\n\n"
+            f"Tool used: {tool.name}\n"
+            f"Tool description: {tool.description}\n\n"
+            f"Tool output: {output}\n\n"
+            "Is this output an appropriate and correct answer to the user's query?"
+        )
+        try:
+            raw = self.llm.complete(
+                system=POST_EXEC_REVIEW_SYSTEM,
+                user=user_prompt,
+                max_tokens=120,
+            )
+            cleaned = re.sub(r"```(?:json)?\s*|```", "", raw).strip()
+            payload = json.loads(cleaned)
+            appropriate: bool = bool(payload.get("appropriate", True))
+            reason: str = payload.get("reason", "")
+            logger.info(
+                "Post-exec review for '%s': appropriate=%s — %s",
+                tool.name, appropriate, reason,
+            )
+            self._emit(EventType.TOOL_REVIEWED, {
+                "name": tool.name,
+                "appropriate": appropriate,
+                "reason": reason,
+            })
+            return appropriate
+        except Exception as exc:
+            logger.warning(
+                "Post-exec review failed for '%s' (%s) — assuming appropriate.",
+                tool.name, exc,
+            )
+            return True
 
     # ── Kwargs extraction ─────────────────────────────────────────────────────
 
