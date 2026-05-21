@@ -19,12 +19,20 @@ Examples:
 - Compute compound interest
 - Extract emails from text
 - Parse and reformat dates
-- Apply a discount schedule to a price list
 
-## How to use
+## Quick start
 
-autoSkill exposes five stable methods through its MCP server.
-You never interact with generated tools directly — you go through these primitives.
+Connect to autoSkill as an MCP server. Five tools, one workflow:
+
+```
+search_tools  →  is there already a tool that does this?
+save_tool     →  no? create one (write the Python code yourself)
+execute_tool  →  run it with test inputs
+save_tool_version →  found a bug or want to improve? update it
+tool_stats    →  check health and usage
+```
+
+## MCP tools
 
 ### 1. `search_tools` — check before creating
 
@@ -42,24 +50,35 @@ Returns ranked results with `tool_id`, similarity score, and health status.
 { "tool_id": 7, "args": { "fahrenheit": 98.6 } }
 ```
 
-### 3. `create_tool` — generate a new tool
+Runs in a sandboxed subprocess with a 10-second timeout.
 
-Only use when `search_tools` finds nothing suitable.
+### 3. `save_tool` — register a new tool
 
-```json
-{ "task": "convert a temperature from fahrenheit to celsius" }
-```
-
-autoSkill will write the Python function, validate it, and save it to the
-registry so it can be retrieved by future `search_tools` calls.
-
-### 4. `improve_tool` — revise a degraded tool
+Use when `search_tools` finds nothing suitable. You (the host LLM) write the
+Python function and provide the name, description, and code. The server
+validates that the code is a safe pure function before saving.
 
 ```json
-{ "tool_id": 7 }
+{
+  "name": "fahrenheit_to_celsius",
+  "description": "Convert a temperature from Fahrenheit to Celsius",
+  "code": "def fahrenheit_to_celsius(fahrenheit: float) -> float:\n    \"\"\"Convert Fahrenheit to Celsius.\"\"\"\n    return (fahrenheit - 32) * 5 / 9"
+}
 ```
 
-Triggers an LLM revision. The original version is preserved in history.
+### 4. `save_tool_version` — update an existing tool
+
+When a tool needs improvement, provide the new code. The previous version is
+preserved in history and the tool's status is reset to "active".
+
+```json
+{
+  "tool_id": 7,
+  "name": "fahrenheit_to_celsius",
+  "description": "Convert Fahrenheit to Celsius with input validation",
+  "code": "def fahrenheit_to_celsius(fahrenheit: float) -> float:\n    ..."
+}
+```
 
 ### 5. `tool_stats` — inspect health
 
@@ -72,27 +91,39 @@ Returns status, success rate, usage count, and user sentiment score.
 ## What autoSkill is NOT for
 
 - Conversational or subjective questions — answer those directly
-- Tasks requiring live data (API calls, web fetches) — unless the tool is
-  explicitly permitted network access
-- One-off queries unlikely to recur — the overhead of tool creation is not
-  worth it
+- Tasks requiring live data (API calls, web fetches) — tools must be pure functions
+- One-off queries unlikely to recur — the overhead of tool creation is not worth it
 
-## Starting the MCP server
+## Connecting
 
-```bash
-# Registry-only (search + execute, no LLM generation)
-python -m skill_agent.mcp_server --db skills.db
+**Remote (Linode / any server):**
 
-# With Anthropic (enables create_tool + improve_tool)
-python -m skill_agent.mcp_server --db skills.db --llm anthropic
-
-# With OpenAI
-python -m skill_agent.mcp_server --db skills.db --llm openai --llm-model gpt-4o
+```json
+{
+  "mcpServers": {
+    "autoskill": {
+      "type": "http",
+      "url": "http://<host>:8000/mcp"
+    }
+  }
+}
 ```
 
-## Architecture note
+Start the server: `skill-agent serve-mcp --host 0.0.0.0 --port 8000`
 
-The intelligence lives in the MCP server, not in this skill file.
-This file is a routing hint — it tells you when and how to reach autoSkill.
-The tool registry, vector search, sandbox, and self-improvement loop all
-run inside the server process.
+**Local (stdio, same machine):**
+
+```json
+{
+  "mcpServers": {
+    "autoskill": {
+      "command": "skill-agent",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+The MCP server is a **dumb runtime** — it stores, searches, and executes tools
+but makes zero AI decisions. All intelligence (when to create, reuse, or
+revise tools) lives in you, the host LLM.

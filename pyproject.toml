@@ -6,7 +6,21 @@ build-backend = "setuptools.build_meta"
 name = "skill-agent"
 version = "0.2.0"
 description = "Self-improving tool-learning AI agent with SDK and CLI"
+readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.10"
+authors = [{name = "autoSkill contributors"}]
+keywords = ["ai", "agent", "tools", "skill", "mcp", "embeddings", "vector-search"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "anthropic>=0.40.0",
     "sentence-transformers>=3.0.0",
@@ -18,7 +32,8 @@ dependencies = [
 openai = ["openai>=1.0.0"]
 rich   = ["rich>=13.0.0"]
 http   = ["fastapi>=0.100.0", "uvicorn>=0.20.0"]
-all    = ["openai>=1.0.0", "rich>=13.0.0", "fastapi>=0.100.0", "uvicorn>=0.20.0"]
+mcp    = ["mcp>=1.0.0"]
+all    = ["openai>=1.0.0", "rich>=13.0.0", "fastapi>=0.100.0", "uvicorn>=0.20.0", "mcp>=1.0.0"]
 
 [project.scripts]
 skill-agent = "skill_agent.cli:main"

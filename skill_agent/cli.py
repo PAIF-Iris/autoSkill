@@ -381,19 +381,8 @@ def _cmd_serve(args) -> None:
     from .tool_registry import ToolRegistry
     reg = ToolRegistry(db_path=args.db)
 
-    agent = None
-    if getattr(args, "llm", None):
-        from .agent import SkillAgent
-        agent = SkillAgent(
-            llm=args.llm,
-            llm_model=getattr(args, "llm_model", None),
-            llm_api_key=getattr(args, "llm_api_key", None),
-            db_path=args.db,
-        )
-
-    mode = f"llm={args.llm}" if agent else "registry-only"
-    _err(f"MCP server starting on stdio (db={args.db}, {mode})")
-    run_server(reg, agent)
+    _err(f"MCP server starting on stdio (db={args.db})")
+    run_server(reg)
 
 
 def _cmd_serve_http(args) -> None:
@@ -423,6 +412,15 @@ def _cmd_serve_http(args) -> None:
     _err(f"HTTP server → http://{cfg.http_host}:{cfg.http_port}  "
          f"(provider={cfg.llm_provider}, db={cfg.db_path})")
     uvicorn.run(app, host=cfg.http_host, port=cfg.http_port)
+
+
+def _cmd_serve_mcp(args) -> None:
+    from .mcp_http_server import _build_mcp
+    from .tool_registry import ToolRegistry
+    reg = ToolRegistry(db_path=args.db)
+    mcp = _build_mcp(reg, host=args.host, port=args.port)
+    _err(f"MCP HTTP server → http://{args.host}:{args.port}/mcp  (db={args.db})")
+    mcp.run(transport="streamable-http")
 
 
 def _cmd_export(args) -> None:
@@ -489,13 +487,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # ── serve ────────────────────────────────────────────────────────────────
     p_serve = sub.add_parser("serve", help="Start the MCP stdio server")
-    p_serve.add_argument("--llm", choices=["anthropic", "openai", "ollama", "mock"],
-                         default=None,
-                         help="Enable create_tool/improve_tool via this LLM provider")
-    p_serve.add_argument("--llm-model", dest="llm_model", default=None,
-                         help="Model name override")
-    p_serve.add_argument("--llm-api-key", dest="llm_api_key", default=None,
-                         help="API key override (falls back to env vars)")
+
+    # ── serve-mcp ────────────────────────────────────────────────────────────
+    p_mcp = sub.add_parser("serve-mcp", help="Start the MCP HTTP server (for remote clients)")
+    p_mcp.add_argument("--host", default="0.0.0.0",
+                       help="Bind host (default: 0.0.0.0)")
+    p_mcp.add_argument("--port", type=int, default=8000,
+                       help="Port (default: 8000)")
 
     # ── serve-http ───────────────────────────────────────────────────────────
     p_http = sub.add_parser("serve-http", help="Start the HTTP REST API server")
@@ -530,6 +528,7 @@ def main() -> None:
         "retire":   _cmd_retire,
         "prune":    _cmd_prune,
         "serve":      _cmd_serve,
+        "serve-mcp":  _cmd_serve_mcp,
         "serve-http": _cmd_serve_http,
         "export":     _cmd_export,
     }

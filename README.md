@@ -62,7 +62,7 @@ Once a tool is written and validated, it runs in a sandboxed subprocess in under
 │  │   health scoring       │    └──────────────────┘    │
 │  └────────────────────────┘                             │
 │                                                         │
-│  Interfaces: Python SDK │ HTTP API │ MCP server │ CLI   │
+│  Interfaces: Python SDK │ HTTP API │ MCP (stdio + HTTP) │ CLI  │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -82,6 +82,7 @@ Once a tool is written and validated, it runs in a sandboxed subprocess in under
 | `config.py` | `AutoSkillConfig` dataclass with `from_env()` |
 | `http_server.py` | FastAPI REST API |
 | `mcp_server.py` | MCP stdio server (5 stable meta-tools) |
+| `mcp_http_server.py` | MCP HTTP server for remote clients (Streamable HTTP) |
 | `cli.py` | `skill-agent` CLI |
 
 ---
@@ -95,8 +96,11 @@ pip install skill-agent
 # With OpenAI support
 pip install 'skill-agent[openai]'
 
-# With HTTP server
+# With HTTP REST API
 pip install 'skill-agent[http]'
+
+# With MCP HTTP server (for remote clients)
+pip install 'skill-agent[mcp]'
 
 # Everything
 pip install 'skill-agent[all]'
@@ -338,18 +342,55 @@ Visit `http://localhost:8000/docs` for the Swagger UI after starting the server.
 ## MCP Server
 
 autoSkill exposes **five stable meta-tools** via the Model Context Protocol,
-compatible with OpenClaw, Claude Desktop, Cursor, VS Code agents, and any
-MCP-aware runtime.
+compatible with Claude Desktop, Claude Code, OpenClaw, Cursor, VS Code agents,
+and any MCP-aware runtime. The MCP server is a **dumb runtime** — all
+intelligence (decision-making, code generation) lives in the host LLM.
+
+### Two ways to run
+
+| Mode | Command | When to use |
+|---|---|---|
+| **Local (stdio)** | `skill-agent serve` | Same machine — Claude Desktop, VS Code |
+| **Remote (HTTP)** | `skill-agent serve-mcp` | Remote server — Linode, Cloudflare Tunnel |
+
+### Remote setup (MCP HTTP)
 
 ```bash
-# Registry-only (search + execute):
-skill-agent serve
-# or:
-python -m skill_agent.mcp_server --db skills.db
+# On your server
+pip install 'skill-agent[mcp]'
+skill-agent serve-mcp --host 0.0.0.0 --port 8000
+```
 
-# With LLM (enables create_tool + improve_tool):
-skill-agent serve --llm anthropic
-python -m skill_agent.mcp_server --db skills.db --llm anthropic
+Client config:
+```json
+{
+  "mcpServers": {
+    "autoskill": {
+      "type": "http",
+      "url": "http://<server-ip>:8000/mcp"
+    }
+  }
+}
+```
+
+### Local setup (MCP stdio)
+
+```bash
+skill-agent serve
+# or
+python -m skill_agent.mcp_server --db skills.db
+```
+
+Client config:
+```json
+{
+  "mcpServers": {
+    "autoskill": {
+      "command": "skill-agent",
+      "args": ["serve"]
+    }
+  }
+}
 ```
 
 ### MCP tools
@@ -358,29 +399,22 @@ python -m skill_agent.mcp_server --db skills.db --llm anthropic
 |---|---|---|
 | `search_tools` | `query`, `top_k` | Semantic search — call this first |
 | `execute_tool` | `tool_id`, `args` | Run a tool by its numeric ID |
-| `create_tool` | `task` | Generate + validate + save a new tool |
-| `improve_tool` | `tool_id` | Revise a degraded tool |
+| `save_tool` | `name`, `description`, `code` | Register a new tool (host provides code) |
+| `save_tool_version` | `tool_id`, `name`, `description`, `code` | Update a tool, snapshotting the old version |
 | `tool_stats` | `tool_id` | Health, usage, and sentiment stats |
 
-### OpenClaw / Claude Desktop configuration
+### Testing with an LLM driver
 
-Add to your MCP config:
-```json
-{
-  "mcpServers": {
-    "autoskill": {
-      "command": "skill-agent",
-      "args": ["serve", "--llm", "anthropic"],
-      "env": {
-        "ANTHROPIC_API_KEY": "sk-ant-..."
-      }
-    }
-  }
-}
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+export MCP_URL=http://172.105.105.81:8000/mcp   # your server
+python mcp_workflow_demo.py
 ```
 
-The `SKILL.md` file in this repository contains the routing hint that tells
-OpenClaw when and how to reach autoSkill.
+This script connects Claude to the remote MCP server and walks through the full
+tool lifecycle: search → create → execute → improve.
+
+The `SKILL.md` file contains the prompt-level routing hint for the host LLM.
 
 ---
 
@@ -409,10 +443,10 @@ skill-agent prune --stale-days 14
 skill-agent export > tools.json
 
 # Start servers
-skill-agent serve                           # MCP stdio (registry-only)
-skill-agent serve --llm anthropic           # MCP stdio (with tool generation)
-skill-agent serve-http --port 8000          # HTTP REST API
-skill-agent serve-http --llm ollama         # HTTP with Ollama
+skill-agent serve                           # MCP stdio (local)
+skill-agent serve-mcp --port 8000          # MCP HTTP (remote)
+skill-agent serve-http --port 8000         # HTTP REST API
+skill-agent serve-http --llm ollama        # HTTP with Ollama
 
 # Global flag (applies to all commands)
 skill-agent --db /path/to/skills.db list
@@ -587,11 +621,14 @@ python example.py --real
 # Run tests (no API key needed)
 python tests.py
 
-# Start HTTP server
+# Start HTTP REST API
 skill-agent serve-http --llm anthropic
 
-# Start MCP server
-skill-agent serve --llm anthropic
+# Start MCP server (local stdio)
+skill-agent serve
+
+# Start MCP server (remote HTTP)
+skill-agent serve-mcp --host 0.0.0.0 --port 8000
 ```
 
 ---

@@ -5,21 +5,24 @@ Exposes five stable meta-tool primitives so that external agents (OpenClaw,
 Claude Desktop, VS Code MCP extension, etc.) can interact with the autoSkill
 runtime without being flooded by the full list of generated tools.
 
+The MCP server is a *dumb runtime* — it stores, searches, and executes tools
+but makes zero AI decisions itself.  The host LLM is responsible for all
+intelligence: deciding when to create, reuse, or revise tools.
+
 Protocol:
   Transport : stdio, Content-Length framed (identical to Language Server Protocol)
   Encoding  : UTF-8 JSON-RPC 2.0
   Version   : MCP 2024-11-05
 
 Exposed MCP tools (stable — never change regardless of what tools are generated):
-  search_tools   — semantic search over the registry
-  execute_tool   — run a tool by ID with given args
-  create_tool    — generate, validate, and register a new tool for a task
-  improve_tool   — trigger LLM revision of a degraded tool
-  tool_stats     — health and usage statistics for a tool
+  search_tools       — semantic search over the registry
+  execute_tool       — run a tool by ID with given args
+  save_tool          — register a new tool (host provides name, description, code)
+  save_tool_version  — update an existing tool, snapshotting the old version
+  tool_stats         — health and usage statistics for a tool
 
 Running:
   python -m skill_agent.mcp_server --db skills.db
-  python -m skill_agent.mcp_server --db skills.db --llm openai --llm-model gpt-4o
 """
 from __future__ import annotations
 
@@ -30,14 +33,88 @@ import logging
 import sys
 from typing import Any, Optional
 
-from .tool_registry import ToolRegistry
+from .tool_registry import ToolRegistry, Tool
 from .executor import execute_tool
+from .embeddings import embed
 
 logger = logging.getLogger(__name__)
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME          = "autoskill"
 SERVER_VERSION       = "1.0.0"
+
+
+# ── Dangerous import categories (mirrors permissions.py) ────────────────────────
+
+_FILESYSTEM_MODULES = frozenset({
+    "os", "pathlib", "shutil", "glob", "tempfile", "io", "fileinput",
+    "fnmatch", "stat", "zipfile", "tarfile", "gzip", "bz2", "lzma",
+})
+
+_NETWORK_MODULES = frozenset({
+    "requests", "urllib", "http", "httpx", "aiohttp", "socket",
+    "ftplib", "smtplib", "poplib", "imaplib", "xmlrpc", "ssl",
+})
+
+_SUBPROCESS_MODULES = frozenset({
+    "subprocess", "multiprocessing", "concurrent", "threading",
+})
+
+
+# ── Static code validation ─────────────────────────────────────────────────────
+
+def _validate_code_static(code: str, fn_name: str) -> tuple[bool, Optional[str]]:
+    """
+    AST-validate code without executing it.  Returns (is_valid, error_message).
+
+    Checks:
+      1. Code is syntactically valid Python.
+      2. A function named `fn_name` is defined.
+      3. The function imports no dangerous modules (filesystem, network, subprocess).
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        return False, f"Syntax error: {exc}"
+
+    # Check function exists
+    found = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == fn_name:
+            found = True
+            break
+
+    if not found:
+        return False, f"No function named '{fn_name}' found in code"
+
+    # Collect top-level imports
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+
+    dangerous: list[str] = []
+    for mod in sorted(imported):
+        category = None
+        if mod in _FILESYSTEM_MODULES:
+            category = "filesystem"
+        elif mod in _NETWORK_MODULES:
+            category = "network"
+        elif mod in _SUBPROCESS_MODULES:
+            category = "subprocess"
+        if category:
+            dangerous.append(f"{mod} ({category})")
+
+    if dangerous:
+        return False, (
+            "Code imports dangerous modules (sandboxed tools must be self-contained "
+            "pure Python): " + ", ".join(dangerous)
+        )
+
+    return True, None
 
 
 # ── Stable meta-tool definitions ─────────────────────────────────────────────
@@ -48,7 +125,7 @@ META_TOOLS = [
         "description": (
             "Search the autoSkill registry for tools that match a natural-language "
             "query. Returns ranked results with similarity score, health status, and "
-            "usage statistics. Use this before create_tool to check if a tool already "
+            "usage statistics. Use this before save_tool to check if a tool already "
             "exists."
         ),
         "inputSchema": {
@@ -89,40 +166,61 @@ META_TOOLS = [
         },
     },
     {
-        "name": "create_tool",
+        "name": "save_tool",
         "description": (
-            "Generate, validate, and register a brand-new Python tool for a "
-            "deterministic task. The LLM writes the function, validates it, then "
-            "saves it to the registry so it can be reused via search_tools in future "
-            "calls. Only use for clearly deterministic, repeatable tasks."
+            "Save a brand-new tool to the registry. You (the host LLM) provide the "
+            "name, description, and Python code. The server statically validates the "
+            "code (must be a pure function — no filesystem, network, or subprocess "
+            "imports), embeds it, and registers it. Returns the new tool_id."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "task": {
+                "name": {
                     "type": "string",
-                    "description": "Plain-English description of what the tool should compute or transform",
+                    "description": "Unique snake_case function name for the tool",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Plain-English description of what the tool does (used for semantic search)",
+                },
+                "code": {
+                    "type": "string",
+                    "description": "Complete Python source code defining the function",
                 },
             },
-            "required": ["task"],
+            "required": ["name", "description", "code"],
         },
     },
     {
-        "name": "improve_tool",
+        "name": "save_tool_version",
         "description": (
-            "Trigger an LLM-driven revision of a degraded or failing tool. "
-            "The revised version is validated before replacing the original; "
-            "the old version is preserved in the version history."
+            "Save a new version of an existing tool. The previous version is "
+            "preserved in the version history. The tool's status is reset to "
+            "'active'. Use this when a tool needs improvement or the host LLM "
+            "has written a better implementation."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "tool_id": {
                     "type": "number",
-                    "description": "Numeric ID of the tool to revise",
+                    "description": "Numeric ID of the tool to update",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Function name (must match the existing tool's name)",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Updated description for the new version",
+                },
+                "code": {
+                    "type": "string",
+                    "description": "Complete Python source code for the new version",
                 },
             },
-            "required": ["tool_id"],
+            "required": ["tool_id", "name", "description", "code"],
         },
     },
     {
@@ -301,37 +399,50 @@ def _handle_execute_tool(req_id: Any, args: dict, registry: ToolRegistry) -> dic
     return _err(req_id, -32000, f"Execution failed: {exec_result.error}")
 
 
-def _handle_create_tool(req_id: Any, args: dict, agent) -> dict:
-    if agent is None:
+def _handle_save_tool(req_id: Any, args: dict, registry: ToolRegistry) -> dict:
+    name = args.get("name", "").strip()
+    description = args.get("description", "").strip()
+    code = args.get("code", "").strip()
+
+    if not name:
+        return _err(req_id, -32602, "'name' is required and must be non-empty")
+    if not description:
+        return _err(req_id, -32602, "'description' is required and must be non-empty")
+    if not code:
+        return _err(req_id, -32602, "'code' is required and must be non-empty")
+
+    # Static validation
+    valid, err_msg = _validate_code_static(code, name)
+    if not valid:
+        return _err(req_id, -32602, f"Code validation failed: {err_msg}")
+
+    # Check for name collisions
+    existing = registry.get_tool_by_name(name)
+    if existing is not None:
         return _err(
-            req_id, -32603,
-            "create_tool requires an LLM — start the server with --llm anthropic (or openai)",
+            req_id, -32602,
+            f"A tool named '{name}' already exists (id={existing.tool_id}). "
+            f"Use save_tool_version to update it.",
         )
 
-    task = args.get("task", "").strip()
-    if not task:
-        return _err(req_id, -32602, "'task' is required and must be non-empty")
+    # Embed and save
+    embedding = embed(f"{name}: {description}")
+    tool = Tool(name=name, description=description, code=code)
 
-    result = agent._create_and_use_tool(task)
-
-    if result.tool_name is None:
-        return _err(req_id, -32000, f"Tool creation failed. Notes: {result.notes}")
+    try:
+        tool_id = registry.save_tool(tool, embedding)
+    except Exception as exc:
+        return _err(req_id, -32603, f"Failed to save tool: {exc}")
 
     return _ok(req_id, _text({
-        "tool_name":  result.tool_name,
-        "action":     result.action_taken,
-        "answer":     result.answer,
-        "notes":      result.notes,
+        "tool_id":     tool_id,
+        "name":        name,
+        "status":      "active",
+        "message":     f"Tool '{name}' saved successfully with id={tool_id}",
     }))
 
 
-def _handle_improve_tool(req_id: Any, args: dict, registry: ToolRegistry, agent) -> dict:
-    if agent is None:
-        return _err(
-            req_id, -32603,
-            "improve_tool requires an LLM — start the server with --llm anthropic (or openai)",
-        )
-
+def _handle_save_tool_version(req_id: Any, args: dict, registry: ToolRegistry) -> dict:
     raw_id = args.get("tool_id")
     if raw_id is None:
         return _err(req_id, -32602, "'tool_id' is required")
@@ -341,21 +452,53 @@ def _handle_improve_tool(req_id: Any, args: dict, registry: ToolRegistry, agent)
     except (TypeError, ValueError):
         return _err(req_id, -32602, f"'tool_id' must be a number, got {raw_id!r}")
 
-    tool = registry.get_tool_by_id(tool_id)
-    if tool is None:
+    name = args.get("name", "").strip()
+    description = args.get("description", "").strip()
+    code = args.get("code", "").strip()
+
+    if not name:
+        return _err(req_id, -32602, "'name' is required and must be non-empty")
+    if not description:
+        return _err(req_id, -32602, "'description' is required and must be non-empty")
+    if not code:
+        return _err(req_id, -32602, "'code' is required and must be non-empty")
+
+    # Look up existing tool
+    existing = registry.get_tool_by_id(tool_id)
+    if existing is None:
         return _err(req_id, -32602, f"No tool found with id={tool_id}")
 
+    # Name must match the existing tool
+    if name != existing.name:
+        return _err(
+            req_id, -32602,
+            f"Name '{name}' does not match existing tool name '{existing.name}'. "
+            f"The function name must stay the same across versions.",
+        )
+
+    # Static validation
+    valid, err_msg = _validate_code_static(code, name)
+    if not valid:
+        return _err(req_id, -32602, f"Code validation failed: {err_msg}")
+
+    # Embed and update
+    embedding = embed(f"{name}: {description}")
     old_version_count = len(registry.get_versions(tool_id))
-    agent._attempt_revision(tool)
+
+    try:
+        registry.update_tool(tool_id, code, description, embedding, reason="Host LLM revision")
+    except Exception as exc:
+        return _err(req_id, -32603, f"Failed to update tool: {exc}")
+
     new_version_count = len(registry.get_versions(tool_id))
 
-    revised = new_version_count > old_version_count
     return _ok(req_id, _text({
-        "tool_id":  tool_id,
-        "name":     tool.name,
-        "revised":  revised,
-        "message":  "Tool successfully revised and updated." if revised else
-                    "Revision attempted but the new version did not pass validation.",
+        "tool_id":        tool_id,
+        "name":           name,
+        "status":         "active",
+        "versions_before": old_version_count,
+        "versions_after":  new_version_count,
+        "message":         f"Tool '{name}' (id={tool_id}) updated — version {new_version_count} saved.",
     }))
 
 
@@ -404,11 +547,7 @@ def handle_tools_list(req: dict) -> dict:
     return _ok(req.get("id"), {"tools": META_TOOLS})
 
 
-def handle_tools_call(
-    req: dict,
-    registry: ToolRegistry,
-    agent,  # Optional[SkillAgent] — None when started without --llm
-) -> dict:
+def handle_tools_call(req: dict, registry: ToolRegistry) -> dict:
     req_id = req.get("id")
     params = req.get("params", {})
     tool_name = params.get("name", "")
@@ -418,10 +557,10 @@ def handle_tools_call(
         return _handle_search_tools(req_id, arguments, registry)
     if tool_name == "execute_tool":
         return _handle_execute_tool(req_id, arguments, registry)
-    if tool_name == "create_tool":
-        return _handle_create_tool(req_id, arguments, agent)
-    if tool_name == "improve_tool":
-        return _handle_improve_tool(req_id, arguments, registry, agent)
+    if tool_name == "save_tool":
+        return _handle_save_tool(req_id, arguments, registry)
+    if tool_name == "save_tool_version":
+        return _handle_save_tool_version(req_id, arguments, registry)
     if tool_name == "tool_stats":
         return _handle_tool_stats(req_id, arguments, registry)
 
@@ -430,7 +569,7 @@ def handle_tools_call(
 
 # ── Dispatch loop ─────────────────────────────────────────────────────────────
 
-def _dispatch(req: dict, registry: ToolRegistry, agent) -> dict | None:
+def _dispatch(req: dict, registry: ToolRegistry) -> dict | None:
     method = req.get("method", "")
 
     if method == "initialize":
@@ -440,7 +579,7 @@ def _dispatch(req: dict, registry: ToolRegistry, agent) -> dict | None:
     if method == "tools/list":
         return handle_tools_list(req)
     if method == "tools/call":
-        return handle_tools_call(req, registry, agent)
+        return handle_tools_call(req, registry)
 
     req_id = req.get("id")
     if req_id is not None:
@@ -448,15 +587,14 @@ def _dispatch(req: dict, registry: ToolRegistry, agent) -> dict | None:
     return None
 
 
-def run_server(registry: ToolRegistry, agent=None) -> None:
+def run_server(registry: ToolRegistry) -> None:
     """Main stdio dispatch loop. Runs until EOF on stdin."""
-    mode = "with LLM" if agent is not None else "registry-only (no LLM)"
-    logger.info("autoSkill MCP server ready [%s] (protocol %s)", mode, MCP_PROTOCOL_VERSION)
+    logger.info("autoSkill MCP server ready (protocol %s)", MCP_PROTOCOL_VERSION)
     while True:
         msg = _read_message()
         if msg is None:
             break
-        response = _dispatch(msg, registry, agent)
+        response = _dispatch(msg, registry)
         if response is not None:
             _write_message(response)
 
@@ -475,27 +613,10 @@ def main() -> None:
     )
     parser.add_argument("--db", default="skills.db",
                         help="Path to the SQLite skills database (default: skills.db)")
-    parser.add_argument("--llm", default=None, choices=["anthropic", "openai"],
-                        help="LLM provider for create_tool / improve_tool (omit to disable those methods)")
-    parser.add_argument("--llm-model", default=None,
-                        help="Model name override (e.g. claude-opus-4-6, gpt-4o)")
-    parser.add_argument("--llm-api-key", default=None,
-                        help="API key override (falls back to env vars)")
     args = parser.parse_args()
 
     registry = ToolRegistry(db_path=args.db)
-
-    agent: Optional[object] = None
-    if args.llm is not None:
-        from .agent import SkillAgent
-        agent = SkillAgent(
-            llm=args.llm,
-            llm_model=args.llm_model,
-            llm_api_key=args.llm_api_key,
-            db_path=args.db,
-        )
-
-    run_server(registry, agent)
+    run_server(registry)
 
 
 if __name__ == "__main__":

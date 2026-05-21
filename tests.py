@@ -24,8 +24,8 @@ from skill_agent.recognizer import recognize
 from skill_agent.embeddings import embed
 from skill_agent.reviser import revise_tool
 from skill_agent.mcp_server import (
-    _extract_input_schema, handle_initialize, handle_tools_list, handle_tools_call,
-    META_TOOLS,
+    _extract_input_schema, _validate_code_static, handle_initialize,
+    handle_tools_list, handle_tools_call, META_TOOLS,
 )
 from skill_agent import SkillAgent
 
@@ -643,11 +643,11 @@ class TestMCPServer(unittest.TestCase):
         names = {t["name"] for t in tools}
         self.assertEqual(
             names,
-            {"search_tools", "execute_tool", "create_tool", "improve_tool", "tool_stats"},
+            {"search_tools", "execute_tool", "save_tool", "save_tool_version", "tool_stats"},
         )
 
     def test_handle_tools_list_always_same_count(self):
-        """tools/list must return the same 5 tools regardless of registry state."""
+        """tools/list must return the same 5 meta-tools regardless of registry state."""
         req = {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}}
         self.assertEqual(len(handle_tools_list(req)["result"]["tools"]), len(META_TOOLS))
 
@@ -667,7 +667,7 @@ class TestMCPServer(unittest.TestCase):
             "jsonrpc": "2.0", "id": 5, "method": "tools/call",
             "params": {"name": "search_tools", "arguments": {"query": "add two numbers together"}},
         }
-        resp = handle_tools_call(req, reg, agent=None)
+        resp = handle_tools_call(req, reg)
         self.assertNotIn("error", resp)
         data = json.loads(resp["result"]["content"][0]["text"])
         self.assertGreaterEqual(data["count"], 1)
@@ -679,7 +679,7 @@ class TestMCPServer(unittest.TestCase):
             "jsonrpc": "2.0", "id": 6, "method": "tools/call",
             "params": {"name": "search_tools", "arguments": {"query": "anything"}},
         }
-        resp = handle_tools_call(req, reg, agent=None)
+        resp = handle_tools_call(req, reg)
         data = json.loads(resp["result"]["content"][0]["text"])
         self.assertEqual(data["count"], 0)
 
@@ -689,7 +689,7 @@ class TestMCPServer(unittest.TestCase):
             "jsonrpc": "2.0", "id": 7, "method": "tools/call",
             "params": {"name": "search_tools", "arguments": {}},
         }
-        resp = handle_tools_call(req, reg, agent=None)
+        resp = handle_tools_call(req, reg)
         self.assertIn("error", resp)
         self.assertEqual(resp["error"]["code"], -32602)
 
@@ -704,7 +704,7 @@ class TestMCPServer(unittest.TestCase):
             "jsonrpc": "2.0", "id": 8, "method": "tools/call",
             "params": {"name": "execute_tool", "arguments": {"tool_id": tid, "args": {"a": 3, "b": 4}}},
         }
-        resp = handle_tools_call(req, reg, agent=None)
+        resp = handle_tools_call(req, reg)
         self.assertNotIn("error", resp)
         data = json.loads(resp["result"]["content"][0]["text"])
         self.assertEqual(data["result"], 7)
@@ -719,7 +719,7 @@ class TestMCPServer(unittest.TestCase):
             "jsonrpc": "2.0", "id": 9, "method": "tools/call",
             "params": {"name": "execute_tool", "arguments": {"tool_id": tid, "args": {"a": 1, "b": 2}}},
         }
-        handle_tools_call(req, reg, agent=None)
+        handle_tools_call(req, reg)
         self.assertEqual(reg.get_tool_by_id(tid).usage_count, 1)
 
     def test_execute_tool_missing_id_returns_error(self):
@@ -728,7 +728,7 @@ class TestMCPServer(unittest.TestCase):
             "jsonrpc": "2.0", "id": 10, "method": "tools/call",
             "params": {"name": "execute_tool", "arguments": {}},
         }
-        resp = handle_tools_call(req, reg, agent=None)
+        resp = handle_tools_call(req, reg)
         self.assertIn("error", resp)
         self.assertEqual(resp["error"]["code"], -32602)
 
@@ -738,31 +738,193 @@ class TestMCPServer(unittest.TestCase):
             "jsonrpc": "2.0", "id": 11, "method": "tools/call",
             "params": {"name": "execute_tool", "arguments": {"tool_id": 9999}},
         }
-        resp = handle_tools_call(req, reg, agent=None)
+        resp = handle_tools_call(req, reg)
         self.assertIn("error", resp)
         self.assertEqual(resp["error"]["code"], -32602)
 
-    # ── create_tool / improve_tool without LLM ────────────────────────────────
+    # ── _validate_code_static ─────────────────────────────────────────────────
 
-    def test_create_tool_without_llm_returns_error(self):
+    def test_validate_code_static_valid(self):
+        valid, err = _validate_code_static(SIMPLE_FN, "add")
+        self.assertTrue(valid)
+        self.assertIsNone(err)
+
+    def test_validate_code_static_syntax_error(self):
+        valid, err = _validate_code_static("def broken(:\n    pass", "broken")
+        self.assertFalse(valid)
+        self.assertIn("Syntax error", err)
+
+    def test_validate_code_static_missing_function(self):
+        valid, err = _validate_code_static(SIMPLE_FN, "nonexistent")
+        self.assertFalse(valid)
+        self.assertIn("No function named", err)
+
+    def test_validate_code_static_dangerous_import(self):
+        code = (
+            "import os\n"
+            "def read_file(path: str) -> str:\n"
+            "    \"\"\"Read a file.\"\"\"\n"
+            "    with open(path) as f:\n"
+            "        return f.read()\n"
+        )
+        valid, err = _validate_code_static(code, "read_file")
+        self.assertFalse(valid)
+        self.assertIn("os", err)
+
+    # ── save_tool ─────────────────────────────────────────────────────────────
+
+    def test_save_tool_success(self):
         reg = _tmp_registry()
         req = {
             "jsonrpc": "2.0", "id": 12, "method": "tools/call",
-            "params": {"name": "create_tool", "arguments": {"task": "add two numbers"}},
+            "params": {
+                "name": "save_tool",
+                "arguments": {
+                    "name": "add",
+                    "description": "Adds two integers a and b",
+                    "code": SIMPLE_FN,
+                },
+            },
         }
-        resp = handle_tools_call(req, reg, agent=None)
-        self.assertIn("error", resp)
-        self.assertEqual(resp["error"]["code"], -32603)
+        resp = handle_tools_call(req, reg)
+        self.assertNotIn("error", resp)
+        data = json.loads(resp["result"]["content"][0]["text"])
+        self.assertGreater(data["tool_id"], 0)
+        self.assertEqual(data["name"], "add")
+        self.assertEqual(data["status"], "active")
 
-    def test_improve_tool_without_llm_returns_error(self):
+        # Verify it's in the registry
+        tool = reg.get_tool_by_id(data["tool_id"])
+        self.assertIsNotNone(tool)
+        self.assertEqual(tool.name, "add")
+
+    def test_save_tool_missing_fields(self):
         reg = _tmp_registry()
         req = {
             "jsonrpc": "2.0", "id": 13, "method": "tools/call",
-            "params": {"name": "improve_tool", "arguments": {"tool_id": 1}},
+            "params": {
+                "name": "save_tool",
+                "arguments": {"name": "test"},
+            },
         }
-        resp = handle_tools_call(req, reg, agent=None)
+        resp = handle_tools_call(req, reg)
         self.assertIn("error", resp)
-        self.assertEqual(resp["error"]["code"], -32603)
+        self.assertEqual(resp["error"]["code"], -32602)
+
+    def test_save_tool_duplicate_name(self):
+        reg = _tmp_registry()
+        t = Tool(name="add", description="Adds two integers", code=SIMPLE_FN)
+        reg.save_tool(t, embed("add: Adds two integers"))
+
+        req = {
+            "jsonrpc": "2.0", "id": 14, "method": "tools/call",
+            "params": {
+                "name": "save_tool",
+                "arguments": {
+                    "name": "add",
+                    "description": "Another adder",
+                    "code": SIMPLE_FN,
+                },
+            },
+        }
+        resp = handle_tools_call(req, reg)
+        self.assertIn("error", resp)
+        self.assertIn("already exists", resp["error"]["message"])
+
+    def test_save_tool_dangerous_code_rejected(self):
+        reg = _tmp_registry()
+        code = (
+            "import os\n"
+            "def bad_tool(path: str) -> str:\n"
+            "    \"\"\"Bad.\"\"\"\n"
+            "    return open(path).read()\n"
+        )
+        req = {
+            "jsonrpc": "2.0", "id": 15, "method": "tools/call",
+            "params": {
+                "name": "save_tool",
+                "arguments": {
+                    "name": "bad_tool",
+                    "description": "Reads files",
+                    "code": code,
+                },
+            },
+        }
+        resp = handle_tools_call(req, reg)
+        self.assertIn("error", resp)
+        self.assertIn("dangerous modules", resp["error"]["message"])
+
+    # ── save_tool_version ─────────────────────────────────────────────────────
+
+    def test_save_tool_version_success(self):
+        reg = _tmp_registry()
+        t = Tool(name="add", description="Adds two integers", code=SIMPLE_FN)
+        tid = reg.save_tool(t, embed("add: Adds two integers"))
+
+        new_code = SIMPLE_FN.replace("return a + b", "return int(a + b)")
+        req = {
+            "jsonrpc": "2.0", "id": 16, "method": "tools/call",
+            "params": {
+                "name": "save_tool_version",
+                "arguments": {
+                    "tool_id": tid,
+                    "name": "add",
+                    "description": "Adds two integers (improved)",
+                    "code": new_code,
+                },
+            },
+        }
+        resp = handle_tools_call(req, reg)
+        self.assertNotIn("error", resp)
+        data = json.loads(resp["result"]["content"][0]["text"])
+        self.assertEqual(data["tool_id"], tid)
+        self.assertEqual(data["name"], "add")
+        self.assertEqual(data["status"], "active")
+        self.assertEqual(data["versions_before"], 0)
+        self.assertEqual(data["versions_after"], 1)
+
+        # Verify version history exists
+        versions = reg.get_versions(tid)
+        self.assertEqual(len(versions), 1)
+
+    def test_save_tool_version_name_mismatch(self):
+        reg = _tmp_registry()
+        t = Tool(name="add", description="Adds two integers", code=SIMPLE_FN)
+        tid = reg.save_tool(t, embed("add: Adds two integers"))
+
+        req = {
+            "jsonrpc": "2.0", "id": 17, "method": "tools/call",
+            "params": {
+                "name": "save_tool_version",
+                "arguments": {
+                    "tool_id": tid,
+                    "name": "different_name",
+                    "description": "Desc",
+                    "code": SIMPLE_FN,
+                },
+            },
+        }
+        resp = handle_tools_call(req, reg)
+        self.assertIn("error", resp)
+        self.assertIn("does not match", resp["error"]["message"])
+
+    def test_save_tool_version_unknown_id(self):
+        reg = _tmp_registry()
+        req = {
+            "jsonrpc": "2.0", "id": 18, "method": "tools/call",
+            "params": {
+                "name": "save_tool_version",
+                "arguments": {
+                    "tool_id": 9999,
+                    "name": "fn",
+                    "description": "Desc",
+                    "code": SIMPLE_FN,
+                },
+            },
+        }
+        resp = handle_tools_call(req, reg)
+        self.assertIn("error", resp)
+        self.assertEqual(resp["error"]["code"], -32602)
 
     # ── tool_stats ────────────────────────────────────────────────────────────
 
@@ -775,7 +937,7 @@ class TestMCPServer(unittest.TestCase):
             "jsonrpc": "2.0", "id": 14, "method": "tools/call",
             "params": {"name": "tool_stats", "arguments": {"tool_id": tid}},
         }
-        resp = handle_tools_call(req, reg, agent=None)
+        resp = handle_tools_call(req, reg)
         self.assertNotIn("error", resp)
         data = json.loads(resp["result"]["content"][0]["text"])
         self.assertEqual(data["name"], "add")
@@ -789,7 +951,7 @@ class TestMCPServer(unittest.TestCase):
             "jsonrpc": "2.0", "id": 15, "method": "tools/call",
             "params": {"name": "tool_stats", "arguments": {"tool_id": 9999}},
         }
-        resp = handle_tools_call(req, reg, agent=None)
+        resp = handle_tools_call(req, reg)
         self.assertIn("error", resp)
         self.assertEqual(resp["error"]["code"], -32602)
 
@@ -801,7 +963,7 @@ class TestMCPServer(unittest.TestCase):
             "jsonrpc": "2.0", "id": 16, "method": "tools/call",
             "params": {"name": "does_not_exist", "arguments": {}},
         }
-        resp = handle_tools_call(req, reg, agent=None)
+        resp = handle_tools_call(req, reg)
         self.assertIn("error", resp)
         self.assertEqual(resp["error"]["code"], -32602)
 
